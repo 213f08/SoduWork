@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -20,6 +22,26 @@ ACTIVE_STATES = {"queued", "running"}
 FINAL_STATES = {"completed", "failed", "cancelled"}
 DECISIONS = {"passed", "failed"}
 
+log = logging.getLogger(__name__)
+
+# An evaluation whose Runner never answers must still converge. Without a deadline the row keeps
+# state "running" forever, the publication gate waits for it, and only a manual cancel helps.
+_EVALUATION_TIMEOUT_SECONDS = 3600
+_EVALUATION_SWEEP_SECONDS = 60
+_TIMEOUT_ERROR = "发布评测超时：执行机长时间没有返回结果，验证已自动结束，可重新发起验证"
+
+loop_health: dict = {"lastSweepAt": "", "lastOkAt": "", "consecutiveErrors": 0,
+                      "lastError": None, "lastCounts": {}}
+
+
+def _env_seconds(name: str, default: int, floor: int) -> int:
+    """Read a positive seconds budget from the environment and fall back to a safe default."""
+    try:
+        value = int(str(os.environ.get(name) or default).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(floor, value)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -27,6 +49,36 @@ def _now() -> datetime:
 
 def _ms(value) -> int | None:
     return int(value.timestamp() * 1000) if value else None
+
+
+def _expired(row, now: datetime | None = None) -> bool:
+    """Report whether an active evaluation outlived the timeout budget."""
+    started = getattr(row, "started_at", None)
+    if not started:
+        return False
+    if started.tzinfo is None:
+        # SQLite stores naive UTC timestamps even for timezone-aware columns.
+        started = started.replace(tzinfo=timezone.utc)
+    return ((now or _now()) - started).total_seconds() > _timeout_seconds()
+
+
+def _timeout_seconds() -> int:
+    """Return the evaluation timeout budget in seconds."""
+    return _env_seconds("SODUWORK_PLUGIN_EVALUATION_TIMEOUT_SECONDS",
+                        _EVALUATION_TIMEOUT_SECONDS, 300)
+
+
+def _sweep_seconds() -> int:
+    """Return the evaluation sweep interval in seconds."""
+    return _env_seconds("SODUWORK_PLUGIN_EVALUATION_SWEEP_SECONDS",
+                        _EVALUATION_SWEEP_SECONDS, 30)
+
+
+def _finalize_timeout(row) -> None:
+    """Close an abandoned evaluation so the publication gate stops waiting for it."""
+    row.state, row.completed_at = "failed", _now()
+    row.active_key = None
+    row.error = _TIMEOUT_ERROR
 
 
 def _cases(version: am.PluginVersion) -> list[dict]:
@@ -353,12 +405,17 @@ async def refresh(session: AsyncSession, row: am.PluginEvaluationRun) -> am.Plug
     if not status.get("ok"):
         row.result = {**dict(row.result or {}), "lastProbe": {
             "ok": False, "error": str(status.get("error") or "")[:500], "at": _ms(_now())}}
+        # An unreachable Runner must not keep the evaluation active forever.
+        if _expired(row):
+            _finalize_timeout(row)
         await session.commit()
         return row
     row.result = {**dict(row.result or {}), "lastProbe": {
         "ok": True, "status": str(status.get("status") or ""),
         "running": bool(status.get("running")), "at": _ms(_now())}}
     if not status.get("done"):
+        if _expired(row):
+            _finalize_timeout(row)
         await session.commit()
         return row
     if status.get("error") or str(status.get("status") or "") in {"failed", "interrupted"}:
@@ -411,6 +468,54 @@ async def list_runs(session: AsyncSession, version: am.PluginVersion,
     gate = await publication_gate(session, version, confirm_without_evaluation=False,
                                   refresh_active=False)
     return {"items": [run_api(row) for row in rows], "gate": gate}
+
+
+async def sweep_once(session: AsyncSession) -> dict:
+    """Finalize evaluations that outlived the timeout budget.
+
+    An evaluation whose Runner already produced the artifact can still stay active when the
+    Runner goes offline before the Hub observes the result. Sweeping keeps the publication gate
+    moving without depending on somebody reloading the management page.
+    """
+    rows = list((await session.execute(select(am.PluginEvaluationRun).where(
+        am.PluginEvaluationRun.state.in_(tuple(ACTIVE_STATES)),
+    ))).scalars().all())
+    expired = 0
+    for row in rows:
+        if not _expired(row):
+            continue
+        _finalize_timeout(row)
+        expired += 1
+    if expired:
+        await session.commit()
+    return {"active": len(rows), "expired": expired}
+
+
+async def sweep_loop() -> None:
+    """Run the supervised evaluation sweep with per-iteration failure isolation and health
+    heartbeats. Expose last successful tick so a stalled sweep remains observable.
+    """
+    from ..db import SessionLocal
+
+    while True:
+        try:
+            async with SessionLocal() as session:
+                out = await sweep_once(session)
+            loop_health["lastOkAt"] = _now().isoformat()
+            loop_health["consecutiveErrors"] = 0
+            loop_health["lastError"] = None
+            loop_health["lastCounts"] = out
+            if out.get("expired"):
+                log.info("发布评测超时收尾：%s 条", out["expired"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - Keep the loop alive after one failed iteration.
+            loop_health["consecutiveErrors"] += 1
+            # Health output stays unauthenticated, so it never carries request details.
+            loop_health["lastError"] = type(error).__name__
+            log.warning("发布评测巡检异常：%s: %s", type(error).__name__, error)
+        loop_health["lastSweepAt"] = _now().isoformat()
+        await asyncio.sleep(_sweep_seconds())
 
 
 async def review(session: AsyncSession, row: am.PluginEvaluationRun, decision: str,

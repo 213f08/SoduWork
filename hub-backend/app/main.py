@@ -145,6 +145,9 @@ async def lifespan(app: FastAPI):
     from .services import task_rework
     from .services import account_mail, account_privacy, task_notifications
     from .services import im_worker
+    # Converge publication evaluations whose Runner stopped answering, so the release gate never
+    # waits for a manual cancel.
+    from .services import plugin_evaluations
     factories = [
         ("account_mail", account_mail.worker_loop),
         ("account_privacy", account_privacy.tick_loop),
@@ -162,6 +165,7 @@ async def lifespan(app: FastAPI):
         ("automation_scheduler", schedule_loop.tick_loop),
         ("deployment_sweep", deployments.sweep_loop),
         ("plugin_workflow", workflow_engine.tick_loop),
+        ("plugin_evaluation_sweep", plugin_evaluations.sweep_loop),
         ("ms_auto", ms_auto.tick_loop),
     ]
     if settings.im_enabled:
@@ -267,7 +271,7 @@ app.add_middleware(DatabaseTimingMiddleware)
 @app.get("/healthz", tags=["meta"])
 async def healthz():
     import os
-    from .services import task_rework
+    from .services import plugin_evaluations, task_rework
     # SODUWORK_DEPLOY_COMMIT identifies the source revision injected by the deployer.
     # Health verification can compare the running revision with the intended deployment.
     # SODUWORK_DEPLOY_AT supplies an ISO 8601 deployment timestamp; leave it empty when unavailable.
@@ -281,7 +285,8 @@ async def healthz():
             "commit": release,
             "releaseTag": os.environ.get("SODUWORK_RELEASE_TAG", "").strip(),
             "deployedAt": os.environ.get("SODUWORK_DEPLOY_AT", ""),
-            "rework": task_rework.loop_health}
+            "rework": task_rework.loop_health,
+            "pluginEvaluation": plugin_evaluations.loop_health}
 
 
 @app.get("/readyz", tags=["meta"])
